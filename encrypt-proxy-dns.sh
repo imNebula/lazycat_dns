@@ -1,5 +1,5 @@
 #!/bin/sh
-# 代理核心 DNS 配置工具 v1.1.1 | 运行：sh encrypt-proxy-dns.sh
+# 代理核心 DNS 配置工具 v1.2.0 | 运行：sh encrypt-proxy-dns.sh
 # 默认自动扫描、检查、备份、写入并重启已运行的对应服务，无需选择。
 # 仅预览：sh encrypt-proxy-dns.sh --dry-run | 帮助：--help | 版本：--version
 # 单文件分发：内嵌 Python，无需其他源码或 pip 依赖。
@@ -34,12 +34,14 @@ import json
 import os
 import re
 import shutil
+import signal
+import fcntl
 import subprocess
 import sys
 import tempfile
 from typing import Any
 
-VERSION = "1.1.1"
+VERSION = "1.2.0"
 
 
 PROVIDERS = (
@@ -146,6 +148,7 @@ class Change:
         self.kind = kind
         self.notes = notes
         self.new_text = new_text
+        self.group: tuple[str, ...] = ()
 
 
 def protocol_for(index: int, protocol: str) -> str:
@@ -1433,11 +1436,184 @@ def load_candidate(path: str, hint: str | None) -> tuple[str, str, dict[str, Any
     return kind, text, cfg
 
 
+def merge_config_values(first: Any, second: Any) -> Any:
+    """Match sing-box multi-file merging: append arrays, retain first scalar."""
+    if isinstance(first, dict):
+        if not isinstance(second, dict):
+            raise ValueError("组合配置的对象与标量类型冲突")
+        result = json.loads(json.dumps(first))
+        for key, value in second.items():
+            result[key] = merge_config_values(result[key], value) if key in result else value
+        return result
+    if isinstance(first, list):
+        return first + (second if isinstance(second, list) else [second])
+    return first
+
+
+def plan_lite_pair(paths: tuple[str, ...], protocol: str, version: tuple[int, int] | None) -> list[Change]:
+    originals = [read_text(path) for path in paths]
+    configs = [loads_jsonc(text) for text in originals]
+    for cfg in configs:
+        if not isinstance(cfg, dict) or "_oboard" in cfg:
+            raise ValueError("singbox-lite 组合配置不是有效的原生配置")
+        if not isinstance(cfg.get("inbounds"), list) or not isinstance(cfg.get("outbounds"), list):
+            raise ValueError("singbox-lite 组合配置缺少 inbounds/outbounds 数组")
+    if version is not None and version < (1, 12):
+        raise ValueError("singbox-lite 适配要求 sing-box 1.12 或更新版本")
+    updated = json.loads(json.dumps(configs))
+    main, relay = updated
+    # DNS has one owner. Consolidate existing relay DNS, including output from
+    # earlier versions of this tool, before replacing public upstreams.
+    combined_dns = merge_config_values(main.get("dns", {}), relay.get("dns", {}))
+    servers = combined_dns.get("servers", [])
+    if not isinstance(servers, list):
+        raise ValueError("组合配置 dns.servers 必须是数组")
+    # Identical entries from an earlier per-file run must not be duplicated.
+    combined_dns["servers"] = []
+    for server in servers:
+        if server not in combined_dns["servers"]:
+            combined_dns["servers"].append(server)
+    tags = [server.get("tag") for server in combined_dns["servers"] if isinstance(server, dict) and server.get("tag")]
+    if len(set(tags)) != len(tags):
+        raise ValueError("组合配置存在定义不同的同名 DNS，请先消除冲突")
+    main["dns"] = combined_dns
+    notes = rewrite_singbox(main, protocol, version or (1, 12), True)
+    primary = next(server["tag"] for server in main["dns"]["servers"]
+                   if server.get("server") == "1.1.1.1" or extract_host(str(server.get("address", ""))) == "1.1.1.1")
+    retarget = {server["tag"] for server in servers if isinstance(server, dict) and server.get("tag") and
+                (not singbox_keep_server(server) or server.get("type") == "local" or server.get("address") == "local")}
+    for cfg in updated:
+        walk_resolvers(cfg, retarget, primary, notes)
+        retarget_dns_rules(cfg.get("route", {}).get("rules"), retarget, primary, notes)
+    # Preserve IP-family preferences, but bind actual default dialing to DoH/DoT.
+    resolver = main.setdefault("route", {}).get("default_domain_resolver")
+    if isinstance(resolver, dict):
+        resolver["server"] = primary
+    else:
+        main["route"]["default_domain_resolver"] = primary
+    relay.pop("dns", None)
+    relay.get("route", {}).pop("default_domain_resolver", None)
+    # Check structural merge before staging files for the real core check.
+    merge_config_values(main, relay)
+    changes = []
+    for path, text, old, new in zip(paths, originals, configs, updated):
+        changed = old != new
+        details = ["singbox-lite：主配置与 relay.json 联合处理，DNS 统一保存在主配置"] if changed else []
+        if changed and json_has_comments(text):
+            details.append("写入后不保留注释，原始内容保存在备份中")
+        change = Change(path, "sing-box", details, dump_json(new, detect_indent(text)) if changed else None)
+        change.group = paths
+        change.original_text = text
+        changes.append(change)
+    return changes
+
+
+def reload_lite_direct() -> tuple[bool, str]:
+    """Only signal the verified singbox-lite process, never execute its script."""
+    pid_file = "/run/singboxlite/sing-box.pid"
+    if not os.path.isfile(pid_file):
+        return False, "未找到 singbox-lite 后台 PID 文件，请手动加载配置。"
+    if not hasattr(os, "pidfd_open") or not hasattr(signal, "pidfd_send_signal"):
+        return False, "当前系统不支持安全的 PID 句柄重载，请通过 sb 手动重启。"
+    fd = None
+    try:
+        pid = int(read_text(pid_file).strip())
+        if pid <= 1:
+            raise ValueError("无效 PID")
+        fd = os.pidfd_open(pid)
+        binary = "/usr/local/bin/sing-box"
+        if os.path.realpath("/proc/{0}/exe".format(pid)) != os.path.realpath(binary):
+            raise ValueError("PID 对应的可执行文件不匹配")
+        with open("/proc/{0}/cmdline".format(pid), "rb") as handle:
+            args = [part.decode() for part in handle.read().split(b"\0") if part]
+        expected = ["run", "-c", "/usr/local/etc/sing-box/config.json",
+                    "-c", "/usr/local/etc/sing-box/relay.json"]
+        if args[1:] != expected:
+            raise ValueError("PID 对应的启动参数不匹配")
+        signal.pidfd_send_signal(fd, signal.SIGHUP)
+        return True, "已向 singbox-lite 后台进程发送重载信号；完成状态请查看 /var/log/sing-box.log。"
+    except (OSError, ValueError) as exc:
+        return False, "后台重载未执行：{0}；请通过 sb 手动重启。".format(exc)
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
+def apply_lite_pair(changes: list[Change], no_check: bool, root: str) -> dict[str, str]:
+    # Share the upstream state lock; refuse concurrent menu updates rather than
+    # editing its multi-file configuration while another writer holds the lock.
+    lock_path = os.path.join(os.path.dirname(changes[0].path), ".singboxlite.lock")
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise ValueError("singbox-lite 正在修改配置，请待操作完成后重新运行") from exc
+        return apply_lite_pair_locked(changes, no_check, root)
+    finally:
+        os.close(fd)
+
+
+def apply_lite_pair_locked(changes: list[Change], no_check: bool, root: str) -> dict[str, str]:
+    """Validate the complete candidate pair, then back up both before writing."""
+    staged: list[str] = []
+    backups: dict[str, str] = {}
+    written: list[str] = []
+    try:
+        for change in changes:
+            fd, path = tempfile.mkstemp(prefix=".encrypt-dns-check-", suffix=".json", dir=os.path.dirname(change.path))
+            staged.append(path)
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(change.new_text if change.new_text is not None else read_text(change.path))
+        if not no_check and os.path.abspath(root) == "/":
+            binary = find_bin(("sing-box",), root)
+            if not binary:
+                raise ValueError("未找到 sing-box，无法联合校验，未写入配置")
+            command = [binary, "check", "-c", staged[0], "-c", staged[1]]
+            result = subprocess.run(command, capture_output=True, text=True, timeout=30,
+                                    cwd=os.path.dirname(changes[0].path), check=False)
+            if result.returncode:
+                raise ValueError("组合配置校验失败，未写入：" + (result.stderr or result.stdout).strip())
+        # Refuse stale plans (e.g. concurrent changes made through the sb menu).
+        for change in changes:
+            expected = getattr(change, "original_text", None)
+            if expected is not None and read_text(change.path) != expected:
+                raise ValueError("配置在扫描后发生变化，请重新运行：" + change.path)
+        for change in changes:
+            dest = backup_path(change.path)
+            shutil.copy2(change.path, dest)
+            backups[change.path] = dest
+        try:
+            for change in changes:
+                if change.new_text is not None:
+                    write_text(change.path, change.new_text)
+                    written.append(change.path)
+        except OSError:
+            for path in written:
+                shutil.copy2(backups[path], path)
+            raise
+        return backups
+    finally:
+        for path in staged:
+            os.unlink(path)
+
+
 def plan(root: str, protocol: str, only_paths: list[str] | None, version: tuple[int, int] | None) -> tuple[list[Change], list[str]]:
     errors: list[str] = []
     loaded: list[tuple[str, str, str, dict[str, Any] | None]] = []
     skipped: list[Change] = []
-    for path, hint in discover(root, only_paths):
+    candidates = discover(root, only_paths)
+    lite_paths = tuple(os.path.join(os.path.abspath(root), "usr/local/etc/sing-box", name)
+                       for name in ("config.json", "relay.json"))
+    paired: list[Change] = []
+    selected = any(os.path.abspath(path) in lite_paths for path, _ in candidates)
+    if selected and all(os.path.isfile(path) for path in lite_paths):
+        try:
+            paired = plan_lite_pair(lite_paths, protocol, version)
+        except (OSError, ValueError) as exc:
+            errors.append("singbox-lite 组合配置：" + str(exc))
+        candidates = [(path, hint) for path, hint in candidates if os.path.abspath(path) not in lite_paths]
+    for path, hint in candidates:
         try:
             item = load_candidate(path, hint)
         except ValueError as exc:
@@ -1461,7 +1637,7 @@ def plan(root: str, protocol: str, only_paths: list[str] | None, version: tuple[
     for key, items in groups.items():
         owners[key] = choose_dns_owner(items)
 
-    changes: list[Change] = list(skipped)
+    changes: list[Change] = list(skipped) + paired
     for path, kind, text, cfg in loaded:
         add_if_missing = False
         if kind in {"sing-box", "xray", "v2ray"} and isinstance(cfg, dict):
@@ -1568,7 +1744,31 @@ def run(args: argparse.Namespace) -> int:
     kinds: set[str] = set()
     wrote = 0
     print("\n  [2/3] 检查并更新配置")
+    completed_groups: set[tuple[str, ...]] = set()
+    lite_written = False
     for change in changes:
+        if change.group:
+            if change.group in completed_groups:
+                continue
+            completed_groups.add(change.group)
+            group = sorted([item for item in changes if item.group == change.group],
+                           key=lambda item: change.group.index(item.path))
+            if not any(item.new_text is not None for item in group):
+                continue
+            try:
+                backups = apply_lite_pair(group, args.no_check, args.root)
+            except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
+                print("  [组合配置失败] " + str(exc), file=sys.stderr)
+                errors.append(str(exc))
+                continue
+            for item in group:
+                if item.new_text is not None:
+                    print("  [已写入] " + item.path)
+                    wrote += 1
+                print("  [备份]   " + backups[item.path])
+            lite_written = True
+            kinds.add("sing-box")
+            continue
         if change.new_text is None:
             continue
         try:
@@ -1594,7 +1794,12 @@ def run(args: argparse.Namespace) -> int:
         for failure in failed:
             print("  [重启失败] " + failure + "；请查看服务日志并手动重启。", file=sys.stderr)
         errors.extend(failed)
-        if not restarted and not failed:
+        if lite_written and "sing-box" not in restarted and not any(item.startswith("sing-box:") for item in failed):
+            reloaded, message = reload_lite_direct()
+            print("  [后台重载] " + message)
+            if not reloaded:
+                errors.append(message)
+        elif not restarted and not failed:
             print("  未找到正在运行的对应服务；请在目标环境启动服务以加载配置。")
     elif args.restart and kinds and os.path.abspath(args.root) != "/":
         print("  离线根目录：不重启本机服务，请在目标环境加载配置。")

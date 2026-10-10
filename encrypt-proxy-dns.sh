@@ -1,5 +1,5 @@
 #!/bin/sh
-# 代理核心 DNS 配置工具 v1.1.0 | 运行：sh encrypt-proxy-dns.sh
+# 代理核心 DNS 配置工具 v1.1.1 | 运行：sh encrypt-proxy-dns.sh
 # 默认自动扫描、检查、备份、写入并重启已运行的对应服务，无需选择。
 # 仅预览：sh encrypt-proxy-dns.sh --dry-run | 帮助：--help | 版本：--version
 # 单文件分发：内嵌 Python，无需其他源码或 pip 依赖。
@@ -39,7 +39,7 @@ import sys
 import tempfile
 from typing import Any
 
-VERSION = "1.1.0"
+VERSION = "1.1.1"
 
 
 PROVIDERS = (
@@ -1327,7 +1327,7 @@ def check_config(kind: str, path: str) -> tuple[bool | None, str]:
 
 def service_active(name: str) -> bool:
     if os.path.isdir("/run/systemd/system") and shutil.which("systemctl"):
-        result = subprocess.run(["systemctl", "is-active", "--quiet", name], check=False)
+        result = subprocess.run(["systemctl", "is-active", "--quiet", name], check=False, timeout=10)
         return result.returncode == 0
     if shutil.which("rc-service"):
         result = subprocess.run(
@@ -1335,6 +1335,7 @@ def service_active(name: str) -> bool:
             check=False,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
+            timeout=10,
         )
         return result.returncode == 0
     return False
@@ -1347,11 +1348,20 @@ def restart_services(kinds: set[str]) -> tuple[list[str], list[str]]:
     use_openrc = shutil.which("rc-service")
     for kind in sorted(kinds):
         for name in SERVICE_NAMES.get(kind, ()):
-            if name in restarted or not service_active(name):
+            if name in restarted:
+                continue
+            print("  [状态检查] {0}（最长等待 10 秒）".format(name), flush=True)
+            try:
+                active = service_active(name)
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                failed.append("{0}: 服务状态检查失败：{1}".format(name, exc))
+                continue
+            if not active:
                 continue
             command = ["systemctl", "restart", name] if use_systemd else ["rc-service", name, "restart"]
             if not use_systemd and not use_openrc:
                 continue
+            print("  [正在重启] {0}（最长等待 60 秒）".format(name), flush=True)
             try:
                 result = subprocess.run(command, check=False, capture_output=True, text=True, timeout=60)
             except (OSError, subprocess.TimeoutExpired) as exc:
@@ -1426,6 +1436,7 @@ def load_candidate(path: str, hint: str | None) -> tuple[str, str, dict[str, Any
 def plan(root: str, protocol: str, only_paths: list[str] | None, version: tuple[int, int] | None) -> tuple[list[Change], list[str]]:
     errors: list[str] = []
     loaded: list[tuple[str, str, str, dict[str, Any] | None]] = []
+    skipped: list[Change] = []
     for path, hint in discover(root, only_paths):
         try:
             item = load_candidate(path, hint)
@@ -1435,6 +1446,11 @@ def plan(root: str, protocol: str, only_paths: list[str] | None, version: tuple[
         if item is None:
             continue
         kind, text, cfg = item
+        if kind == "sing-box" and isinstance(cfg, dict) and "_oboard" in cfg:
+            skipped.append(Change(path, kind, [
+                "含 _oboard 管理字段，不是可直接交给 sing-box 校验的配置；请通过对应管理程序调整 DNS。"
+            ], None))
+            continue
         loaded.append((path, kind, text, cfg))
 
     owners: dict[tuple[str, str], str | None] = {}
@@ -1445,7 +1461,7 @@ def plan(root: str, protocol: str, only_paths: list[str] | None, version: tuple[
     for key, items in groups.items():
         owners[key] = choose_dns_owner(items)
 
-    changes: list[Change] = []
+    changes: list[Change] = list(skipped)
     for path, kind, text, cfg in loaded:
         add_if_missing = False
         if kind in {"sing-box", "xray", "v2ray"} and isinstance(cfg, dict):
@@ -1517,9 +1533,15 @@ def apply_change(change: Change, no_check: bool, root: str) -> tuple[bool, str]:
 
 def print_report(changes: list[Change], errors: list[str], apply: bool) -> None:
     pending = [item for item in changes if item.new_text is not None]
+    skipped_count = sum(item.new_text is None and bool(item.notes) for item in changes)
     print("\n  [1/3] 扫描配置")
-    print("  发现 {0} 份配置 · 待更新 {1} 份 · 无需修改 {2} 份".format(
-        len(changes), len(pending), len(changes) - len(pending)))
+    print("  发现 {0} 份配置 · 待更新 {1} 份 · 无需修改 {2} 份 · 跳过 {3} 份".format(
+        len(changes), len(pending), len(changes) - len(pending) - skipped_count, skipped_count))
+    for item in changes:
+        if item.new_text is None and item.notes:
+            print("  [跳过] " + item.path)
+            for note in item.notes:
+                print("         " + note)
     for item in pending:
         print("\n  > [{0}] {1}".format(item.kind, item.path))
         for note in item.notes:
@@ -1586,7 +1608,7 @@ def run(args: argparse.Namespace) -> int:
     if not changes:
         print("  未发现支持的配置文件：请确认代理已安装，或在命令后指定配置路径。")
     elif not wrote and not errors:
-        print("  配置符合当前设置，无需修改。")
+        print("  本次无配置更新；跳过原因（如有）见扫描结果。")
     if wrote:
         print("  备份已保存至原配置所在目录；需要回退时恢复备份并重启对应服务。")
     print("  ====================================================\n")

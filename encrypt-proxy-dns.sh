@@ -1,13 +1,48 @@
 #!/bin/sh
-# 代理核心 DNS 配置工具 v1.2.0 | 运行：sh encrypt-proxy-dns.sh
+# 代理核心 DNS 配置工具 v1.2.1 | 运行：sh encrypt-proxy-dns.sh
 # 默认自动扫描、检查、备份、写入并重启已运行的对应服务，无需选择。
 # 仅预览：sh encrypt-proxy-dns.sh --dry-run | 帮助：--help | 版本：--version
 # 单文件分发：内嵌 Python，无需其他源码或 pip 依赖。
-if ! command -v python3 >/dev/null 2>&1; then
-    echo '需要 Python 3.9+。Alpine: apk add python3；Debian/Ubuntu: apt-get update && apt-get install -y python3' >&2
-    exit 1
+# 运行依赖在脚本内部安装；下载工具不属于运行依赖。
+run_as_root() {
+    if [ "$(id -u)" -eq 0 ]; then
+        "$@"
+    elif command -v sudo >/dev/null 2>&1; then
+        sudo "$@"
+    else
+        echo "需要管理员权限，请以 root 身份运行，或先安装 sudo。" >&2
+        return 1
+    fi
+}
+
+python_ready() {
+    command -v python3 >/dev/null 2>&1 &&
+        python3 -c 'import sys; sys.exit(sys.version_info < (3, 9))' >/dev/null 2>&1
+}
+
+if ! python_ready; then
+    echo "[依赖安装] 需要 Python 3.9+，正在安装 python3 和系统 CA 证书。"
+    if command -v apk >/dev/null 2>&1; then
+        run_as_root apk add --no-cache python3 ca-certificates || exit 1
+    elif command -v apt-get >/dev/null 2>&1; then
+        run_as_root apt-get update || exit 1
+        run_as_root env DEBIAN_FRONTEND=noninteractive \
+            apt-get install -y python3 ca-certificates || exit 1
+    elif command -v dnf >/dev/null 2>&1; then
+        run_as_root dnf install -y python3 ca-certificates || exit 1
+    else
+        echo "无法自动安装依赖；请安装 Python 3.9+ 后重新运行。" >&2
+        exit 1
+    fi
+    if ! python_ready; then
+        echo "安装后仍未找到 Python 3.9+；请升级 Python 或系统后重新运行。" >&2
+        exit 1
+    fi
 fi
 
+# 解析参数后再决定是否提权；预览、自检和离线处理保持当前身份。
+ENCRYPT_DNS_SCRIPT="$0"
+export ENCRYPT_DNS_SCRIPT
 exec python3 - "$@" <<'ENCRYPT_PROXY_DNS_PYTHON'
 """把 LXC 里代理核心的 DNS 上游换成三家海外加密 DNS。
 
@@ -41,7 +76,7 @@ import sys
 import tempfile
 from typing import Any
 
-VERSION = "1.2.0"
+VERSION = "1.2.1"
 
 
 PROVIDERS = (
@@ -2032,6 +2067,12 @@ def main() -> int:
     args = build_parser().parse_args()
     if args.self_test:
         return self_test()
+    if args.apply and os.path.abspath(args.root) == "/" and os.geteuid() != 0:
+        script = os.environ.get("ENCRYPT_DNS_SCRIPT", "")
+        if not shutil.which("sudo") or not os.path.isfile(script):
+            print("修改系统配置需要管理员权限，请以 root 身份运行已下载的脚本。", file=sys.stderr)
+            return 1
+        os.execvp("sudo", ["sudo", "sh", os.path.abspath(script), *sys.argv[1:]])
     return run(args)
 
 

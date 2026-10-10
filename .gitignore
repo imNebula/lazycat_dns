@@ -1,0 +1,6 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+
+# 本地回归测试，不随仓库发布
+tests/
